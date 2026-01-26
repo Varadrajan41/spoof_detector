@@ -1,0 +1,15 @@
+spoofenv/
+
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+
+# keep big audio out of git
+*.wav
+*.mp3
+
+# if you save temp decodes
+tmp/
+outputs/
