@@ -25,7 +25,7 @@ HOP_SECONDS = float(os.getenv("ROBUST_HOP_SECONDS", "2.0"))
 # MODEL_ID = os.getenv("MODEL_ID", "WWWxp/wav2vec2_spoof_dection1") # can be improved - working
 # MODEL_ID = os.getenv("MODEL_ID", "HyperMoon/wav2vec2-base-960h-finetuned-deepfake") # straight no
 
-# MODEL_ID = os.getenv("MODEL_ID", "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification") # best yet
+MODEL_ID = os.getenv("MODEL_ID", "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification") # best yet
 # MODEL_ID = os.getenv("MODEL_ID", "DavidCombei/wavLM-base-Deepfake_V2") # try in benchmarking not reliable though- can't say- benchmark
 # MODEL_ID = os.getenv("MODEL_ID", "microsoft/wavlm-base-plus-sv") # try another time - getting some error  from layers
 # -------------------- Model --------------------
