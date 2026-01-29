@@ -16,61 +16,165 @@ from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 app = Flask(__name__)
 
 TARGET_SR = 16000
-FIXED_NUM_SAMPLES = 64600  # ~4.04s at 16kHz (your existing window)
+FIXED_NUM_SAMPLES = 64600  # ~4.04s at 16kHz
 DEFAULT_THRESHOLD = float(os.getenv("SPOOF_THRESHOLD", "0.3"))
+
 DEFAULT_TOPK = int(os.getenv("ROBUST_TOPK", "3"))
 HOP_SECONDS = float(os.getenv("ROBUST_HOP_SECONDS", "2.0"))
 
-# New model (spoof vs bonafide)
-# MODEL_ID = os.getenv("MODEL_ID", "WWWxp/wav2vec2_spoof_dection1") # can be improved - working
-# MODEL_ID = os.getenv("MODEL_ID", "HyperMoon/wav2vec2-base-960h-finetuned-deepfake") # straight no
+# ---- Ensemble model IDs (no HyperMoon) ----
+MODEL_A_ID = os.getenv("MODEL_A_ID", "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification")
+MODEL_B_ID = os.getenv("MODEL_B_ID", "garystafford/wav2vec2-deepfake-voice-detector")
 
-MODEL_ID = os.getenv("MODEL_ID", "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification") # best yet
-# MODEL_ID = os.getenv("MODEL_ID", "garystafford/wav2vec2-deepfake-voice-detector") # try as this is the fine tuned model of above best model
- # 
-# MODEL_ID = os.getenv("MODEL_ID", "DavidCombei/wavLM-base-Deepfake_V2") # try in benchmarking not reliable though- can't say- benchmark
-# MODEL_ID = os.getenv("MODEL_ID", "microsoft/wavlm-base-plus-sv") # try another time - getting some error  from layers
-# -------------------- Model --------------------
+# weights for fusion (must sum ~1; we normalize anyway)
+MODEL_A_W = float(os.getenv("MODEL_A_WEIGHT", "0.6"))
+MODEL_B_W = float(os.getenv("MODEL_B_WEIGHT", "0.4"))
+
+# -------------------- Device --------------------
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+MODEL_DEVICE = get_device()
 
-def load_model_and_extractor(device: torch.device):
-    extractor = AutoFeatureExtractor.from_pretrained(MODEL_ID)
-    model = AutoModelForAudioClassification.from_pretrained(MODEL_ID)
+# -------------------- Model loading --------------------
+def load_one_model(model_id: str, device: torch.device):
+    extractor = AutoFeatureExtractor.from_pretrained(model_id)
+    model = AutoModelForAudioClassification.from_pretrained(model_id)
     model.eval().to(device)
     return model, extractor
 
+MODEL_A, FE_A = load_one_model(MODEL_A_ID, MODEL_DEVICE)
+MODEL_B, FE_B = load_one_model(MODEL_B_ID, MODEL_DEVICE)
 
-MODEL_DEVICE = get_device()
-MODEL, FEATURE_EXTRACTOR = load_model_and_extractor(MODEL_DEVICE)
+def _normalize_weights(w1: float, w2: float) -> Tuple[float, float]:
+    s = w1 + w2
+    if s <= 0:
+        return 0.5, 0.5
+    return w1 / s, w2 / s
 
+MODEL_A_W, MODEL_B_W = _normalize_weights(MODEL_A_W, MODEL_B_W)
 
-def infer_probs_from_wav_batch(wav_batch: torch.Tensor) -> torch.Tensor:
+def get_label_indices(model) -> Tuple[int, int, Dict[str, Any]]:
     """
-    wav_batch: [B, T] float32 waveform, 16kHz mono, values ~[-1,1]
-    returns probs: [B, 2] -> [p_bonafide, p_spoof] for this model
+    Returns (bonafide_index, spoof_index, debug_info) by reading config labels.
+    Tries to find labels like fake/spoof/bonafide/real.
+    Falls back to (0,1) if ambiguous.
+    """
+    id2label = getattr(model.config, "id2label", None) or {}
+    # id2label keys may be int or str in practice
+    norm = {}
+    for k, v in id2label.items():
+        try:
+            kk = int(k)
+        except Exception:
+            kk = k
+        norm[kk] = str(v).lower()
+
+    # search for spoof/fake first
+    spoof_candidates = {"fake", "spoof", "ai", "synthetic", "deepfake"}
+    bona_candidates = {"real", "bonafide", "human", "genuine"}
+
+    spoof_idx = None
+    bona_idx = None
+
+    for k, v in norm.items():
+        if any(tok in v for tok in spoof_candidates):
+            spoof_idx = k
+        if any(tok in v for tok in bona_candidates):
+            bona_idx = k
+
+    # if still ambiguous, try label2id
+    label2id = getattr(model.config, "label2id", None) or {}
+    label2id_norm = {str(k).lower(): int(v) for k, v in label2id.items()} if isinstance(label2id, dict) else {}
+
+    if spoof_idx is None:
+        for key in ["fake", "spoof", "ai", "synthetic", "deepfake"]:
+            if key in label2id_norm:
+                spoof_idx = label2id_norm[key]
+                break
+
+    if bona_idx is None:
+        for key in ["real", "bonafide", "human", "genuine"]:
+            if key in label2id_norm:
+                bona_idx = label2id_norm[key]
+                break
+
+    # final fallback
+    if bona_idx is None or spoof_idx is None:
+        bona_idx, spoof_idx = 0, 1
+
+    dbg = {
+        "id2label": id2label,
+        "label2id": label2id,
+        "resolved_indices": {"bonafide": bona_idx, "spoof": spoof_idx},
+    }
+    return int(bona_idx), int(spoof_idx), dbg
+
+BONA_A, SPOOF_A, LABELDBG_A = get_label_indices(MODEL_A)
+BONA_B, SPOOF_B, LABELDBG_B = get_label_indices(MODEL_B)
+
+def infer_probs_one(model, extractor, wav_batch: torch.Tensor, bona_idx: int, spoof_idx: int) -> Tuple[List[float], List[float]]:
+    """
+    wav_batch: [B, T] float32 waveform, 16kHz mono, ~[-1,1]
+    returns pb_list, ps_list (python lists) aligned with batch order
     """
     if wav_batch.dim() != 2:
-        raise ValueError(f"Expected wav_batch [B,T], got shape {tuple(wav_batch.shape)}")
+        raise ValueError(f"Expected wav_batch [B,T], got {tuple(wav_batch.shape)}")
 
-    # feature extractor expects CPU arrays/lists
     wav_list = [w.detach().cpu().numpy() for w in wav_batch]
-
-    inputs = FEATURE_EXTRACTOR(
-        wav_list,
-        sampling_rate=TARGET_SR,
-        return_tensors="pt",
-        padding=True,
-    )
+    inputs = extractor(wav_list, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
     inputs = {k: v.to(MODEL_DEVICE) for k, v in inputs.items()}
 
     with torch.no_grad():
-        out = MODEL(**inputs)
-        probs = torch.softmax(out.logits, dim=-1)
+        out = model(**inputs)
+        probs = torch.softmax(out.logits, dim=-1)  # [B, C]
 
-    return probs
+    pb = probs[:, bona_idx].detach().cpu().tolist()
+    ps = probs[:, spoof_idx].detach().cpu().tolist()
+    return pb, ps
 
+def infer_probs_ensemble(wav_batch: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Returns:
+      fused_probs: [B, 2] where [:,0]=p_bonafide, [:,1]=p_spoof
+      debug: per-model summary
+    """
+    pb_a, ps_a = infer_probs_one(MODEL_A, FE_A, wav_batch, BONA_A, SPOOF_A)
+    pb_b, ps_b = infer_probs_one(MODEL_B, FE_B, wav_batch, BONA_B, SPOOF_B)
+
+    # fuse spoof + bonafide with weights (then renormalize)
+    pb_f = []
+    ps_f = []
+    for i in range(len(pb_a)):
+        ps = MODEL_A_W * float(ps_a[i]) + MODEL_B_W * float(ps_b[i])
+        pb = MODEL_A_W * float(pb_a[i]) + MODEL_B_W * float(pb_b[i])
+        s = pb + ps
+        if s > 0:
+            pb /= s
+            ps /= s
+        pb_f.append(pb)
+        ps_f.append(ps)
+
+    fused = torch.tensor(list(zip(pb_f, ps_f)), dtype=torch.float32)  # [B,2]
+
+    debug = {
+        "weights": {"model_a": MODEL_A_W, "model_b": MODEL_B_W},
+        "model_a": {
+            "id": MODEL_A_ID,
+            "bonafide_idx": BONA_A,
+            "spoof_idx": SPOOF_A,
+            "p_spoof_max": float(max(ps_a)) if ps_a else None,
+            "p_spoof_mean": float(sum(ps_a) / len(ps_a)) if ps_a else None,
+        },
+        "model_b": {
+            "id": MODEL_B_ID,
+            "bonafide_idx": BONA_B,
+            "spoof_idx": SPOOF_B,
+            "p_spoof_max": float(max(ps_b)) if ps_b else None,
+            "p_spoof_mean": float(sum(ps_b) / len(ps_b)) if ps_b else None,
+        },
+    }
+    return fused, debug
 
 # -------------------- Audio utils --------------------
 def sniff_audio_format(data: bytes) -> Optional[str]:
@@ -81,7 +185,6 @@ def sniff_audio_format(data: bytes) -> Optional[str]:
     if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
         return "mp3"
     return None
-
 
 def bytes_to_wav_16k_mono(audio_bytes: bytes, audio_format: Optional[str]) -> Tuple[torch.Tensor, Dict[str, Any]]:
     fmt = audio_format or sniff_audio_format(audio_bytes)
@@ -110,13 +213,7 @@ def bytes_to_wav_16k_mono(audio_bytes: bytes, audio_format: Optional[str]) -> Tu
     }
     return wav, meta
 
-
 def pad_or_truncate(wav_1xt: torch.Tensor, target_len: int, pad_mode: str = "repeat") -> Tuple[torch.Tensor, str]:
-    """
-    Strict fixed-length enforcement.
-    - short: repeat-pad (recommended) or zero-pad
-    - long: truncate
-    """
     t = int(wav_1xt.shape[1])
     if t <= 0:
         return torch.zeros((1, target_len), dtype=wav_1xt.dtype), "empty_zero_padded"
@@ -133,7 +230,6 @@ def pad_or_truncate(wav_1xt: torch.Tensor, target_len: int, pad_mode: str = "rep
 
     return wav_1xt, "unchanged"
 
-
 # -------------------- Robust helpers --------------------
 def parse_bool(v) -> bool:
     if v is None:
@@ -142,12 +238,7 @@ def parse_bool(v) -> bool:
         return v
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-
 def get_windows(wav_1xt: torch.Tensor, win_len: int, hop_len: int) -> torch.Tensor:
-    """
-    wav_1xt: [1, T]
-    returns windows: [N, win_len]
-    """
     assert wav_1xt.dim() == 2 and wav_1xt.size(0) == 1
     T = wav_1xt.size(1)
 
@@ -166,8 +257,7 @@ def get_windows(wav_1xt: torch.Tensor, win_len: int, hop_len: int) -> torch.Tens
         chunk = wav_1xt[:, start:end]
         chunk, _ = pad_or_truncate(chunk, win_len, pad_mode="repeat")
         chunks.append(chunk.squeeze(0))
-    return torch.stack(chunks, dim=0)
-
+    return torch.stack(chunks, dim=0)  # [N, win_len]
 
 def topk_mean_probs(p_bonafide_list: List[float], p_spoof_list: List[float], k: int) -> Tuple[float, float, Dict[str, Any]]:
     n = len(p_spoof_list)
@@ -192,7 +282,6 @@ def topk_mean_probs(p_bonafide_list: List[float], p_spoof_list: List[float], k: 
         "p_spoof_mean": float(sum(p_spoof_list) / n),
     }
     return float(pb), float(ps), stats
-
 
 # -------------------- Explanation --------------------
 def make_explanation_text(
@@ -230,16 +319,21 @@ def make_explanation_text(
         else:
             parts.append("Mode=robust: used sliding windows and top-K mean aggregation.")
 
-    parts.append(f"Scores: spoof={p_spoof:.6f}, bonafide={p_bonafide:.6f}; threshold={threshold:.2f}.")
+    parts.append(f"Ensemble scores: spoof={p_spoof:.6f}, bonafide={p_bonafide:.6f}; threshold={threshold:.2f}.")
     parts.append(f"Final classification: {classification} (confidence={confidence:.4f}).")
     return " ".join(parts)
-
 
 # -------------------- Routes --------------------
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "device": str(MODEL_DEVICE), "model_id": MODEL_ID})
-
+    return jsonify({
+        "status": "ok",
+        "device": str(MODEL_DEVICE),
+        "ensemble": {
+            "model_a": {"id": MODEL_A_ID, "weight": MODEL_A_W},
+            "model_b": {"id": MODEL_B_ID, "weight": MODEL_B_W},
+        },
+    })
 
 @app.post("/detect")
 def detect():
@@ -321,22 +415,23 @@ def detect():
     pad_action = "unchanged"
     mode = "robust" if do_sliding else "fast"
     window_stats: Optional[Dict[str, Any]] = None
+    ensemble_debug: Optional[Dict[str, Any]] = None
 
     try:
         if not do_sliding:
             wav_fixed, pad_action = pad_or_truncate(wav, FIXED_NUM_SAMPLES, pad_mode="repeat")  # [1,64600]
-            probs = infer_probs_from_wav_batch(wav_fixed)  # [1,2]
-            p_bonafide = float(probs[0, 0].item())
-            p_spoof = float(probs[0, 1].item())
+            fused_probs, ensemble_debug = infer_probs_ensemble(wav_fixed)  # [1,2]
+            p_bonafide = float(fused_probs[0, 0].item())
+            p_spoof = float(fused_probs[0, 1].item())
         else:
             hop_len = int(HOP_SECONDS * TARGET_SR)
             win_len = FIXED_NUM_SAMPLES
 
             windows = get_windows(wav, win_len=win_len, hop_len=hop_len)  # [N,64600]
-            probs = infer_probs_from_wav_batch(windows)  # [N,2]
+            fused_probs, ensemble_debug = infer_probs_ensemble(windows)    # [N,2]
 
-            pb_list = probs[:, 0].detach().cpu().tolist()
-            ps_list = probs[:, 1].detach().cpu().tolist()
+            pb_list = fused_probs[:, 0].detach().cpu().tolist()
+            ps_list = fused_probs[:, 1].detach().cpu().tolist()
 
             p_bonafide, p_spoof, stats = topk_mean_probs(pb_list, ps_list, k=topk)
             pad_action = "sliding_windows"
@@ -350,7 +445,7 @@ def detect():
     except Exception as e:
         return jsonify({"error": f"Model inference failed: {str(e)}"}), 500
 
-    # Decision (spoof => AI_GENERATED)
+    # Decision
     if p_spoof >= DEFAULT_THRESHOLD:
         classification = "AI_GENERATED"
         confidence = p_spoof
@@ -375,9 +470,12 @@ def detect():
         "confidence": round(float(confidence), 4),
         "explanation_text": explanation_text,
         "explanation": {
-            "model_id": MODEL_ID,
-            "model_type": "Wav2Vec2 audio classification (bonafide vs spoof)",
-            "label_mapping": {"0": "bonafide(HUMAN)", "1": "spoof(AI)"},
+            "ensemble": {
+                "model_a": {"id": MODEL_A_ID, "weight": MODEL_A_W},
+                "model_b": {"id": MODEL_B_ID, "weight": MODEL_B_W},
+                "debug": ensemble_debug,
+            },
+            "label_mapping": {"bonafide": "real(HUMAN)", "spoof": "fake(AI)"},
             "language": language,
             "audio_meta": audio_meta,
             "waveform_stats": wav_stats,
@@ -397,8 +495,7 @@ def detect():
         "processing_ms": int((time.time() - t0) * 1000),
     }), 200
 
-
 if __name__ == "__main__":
-    # app.run(host="0.0.0.0", port=5000, debug=True)
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
+    # app.run(host="0.0.0.0", port=5000, debug=True)
