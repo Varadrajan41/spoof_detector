@@ -4,6 +4,7 @@ import time
 import os
 import math
 from typing import Dict, Any, Tuple, Optional, List
+from flask import render_template
 
 from flask import Flask, request, jsonify
 
@@ -15,25 +16,45 @@ from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 
 app = Flask(__name__)
 
+# -------------------- Hackathon Spec Controls --------------------
+API_KEY = os.getenv("API_KEY", "sk_test_123456789")  # set this in deployment env
+SUPPORTED_LANGS = {"tamil", "english", "hindi", "malayalam", "telugu"}
+
+# -------------------- Audio / Inference Params --------------------
 TARGET_SR = 16000
-FIXED_NUM_SAMPLES = 64600  # ~4.04s at 16kHz (your existing window)
+FIXED_NUM_SAMPLES = 64600  # ~4.04s at 16kHz
+
 DEFAULT_THRESHOLD = float(os.getenv("SPOOF_THRESHOLD", "0.3"))
 DEFAULT_TOPK = int(os.getenv("ROBUST_TOPK", "3"))
 HOP_SECONDS = float(os.getenv("ROBUST_HOP_SECONDS", "2.0"))
 
+# Auto-robust behavior: if clip longer than window, slide windows
+AUTO_ROBUST = os.getenv("AUTO_ROBUST", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# Model
+MODEL_ID = os.getenv("MODEL_ID", "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification")
 # New model (spoof vs bonafide)
 # MODEL_ID = os.getenv("MODEL_ID", "WWWxp/wav2vec2_spoof_dection1") # can be improved - working
 # MODEL_ID = os.getenv("MODEL_ID", "HyperMoon/wav2vec2-base-960h-finetuned-deepfake") # straight no
-
-MODEL_ID = os.getenv("MODEL_ID", "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification") # best yet
 # MODEL_ID = os.getenv("MODEL_ID", "garystafford/wav2vec2-deepfake-voice-detector") # try as this is the fine tuned model of above best model
- # 
 # MODEL_ID = os.getenv("MODEL_ID", "DavidCombei/wavLM-base-Deepfake_V2") # try in benchmarking not reliable though- can't say- benchmark
 # MODEL_ID = os.getenv("MODEL_ID", "microsoft/wavlm-base-plus-sv") # try another time - getting some error  from layers
+
+# Optional: include debug fields in response (keep OFF for hackathon)
+INCLUDE_DEBUG = os.getenv("INCLUDE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# -------------------- Auth --------------------
+@app.before_request
+def require_api_key():
+    # enforce only for the hackathon endpoint (and optionally others)
+    if request.path == "/api/voice-detection":
+        key = request.headers.get("x-api-key", "")
+        if not key or key != API_KEY:
+            return jsonify({"status": "error", "message": "Invalid API key or malformed request"}), 401
+
 # -------------------- Model --------------------
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 def load_model_and_extractor(device: torch.device):
     extractor = AutoFeatureExtractor.from_pretrained(MODEL_ID)
@@ -41,20 +62,49 @@ def load_model_and_extractor(device: torch.device):
     model.eval().to(device)
     return model, extractor
 
-
 MODEL_DEVICE = get_device()
 MODEL, FEATURE_EXTRACTOR = load_model_and_extractor(MODEL_DEVICE)
 
+def _resolve_label_indices(model) -> Tuple[int, int]:
+    """
+    Resolve bonafide vs spoof indices robustly from config.
+    Falls back to (0,1).
+    """
+    id2label = getattr(model.config, "id2label", None) or {}
+    norm = {}
+    for k, v in id2label.items():
+        try:
+            kk = int(k)
+        except Exception:
+            continue
+        norm[kk] = str(v).lower()
+
+    spoof_tokens = ("spoof", "fake", "ai", "synthetic", "deepfake")
+    bona_tokens = ("bonafide", "bona-fide", "real", "human", "genuine")
+
+    spoof_idx = None
+    bona_idx = None
+
+    for i, lab in norm.items():
+        if any(t in lab for t in spoof_tokens):
+            spoof_idx = i
+        if any(t in lab for t in bona_tokens):
+            bona_idx = i
+
+    if bona_idx is None or spoof_idx is None:
+        return 0, 1
+    return int(bona_idx), int(spoof_idx)
+
+BONA_IDX, SPOOF_IDX = _resolve_label_indices(MODEL)
 
 def infer_probs_from_wav_batch(wav_batch: torch.Tensor) -> torch.Tensor:
     """
     wav_batch: [B, T] float32 waveform, 16kHz mono, values ~[-1,1]
-    returns probs: [B, 2] -> [p_bonafide, p_spoof] for this model
+    returns probs: [B, 2] -> [p_bonafide, p_spoof]
     """
     if wav_batch.dim() != 2:
         raise ValueError(f"Expected wav_batch [B,T], got shape {tuple(wav_batch.shape)}")
 
-    # feature extractor expects CPU arrays/lists
     wav_list = [w.detach().cpu().numpy() for w in wav_batch]
 
     inputs = FEATURE_EXTRACTOR(
@@ -67,39 +117,55 @@ def infer_probs_from_wav_batch(wav_batch: torch.Tensor) -> torch.Tensor:
 
     with torch.no_grad():
         out = MODEL(**inputs)
-        probs = torch.softmax(out.logits, dim=-1)
+        probs_full = torch.softmax(out.logits, dim=-1)  # [B, C]
 
+    # map to [bonafide, spoof]
+    pb = probs_full[:, BONA_IDX].unsqueeze(1)
+    ps = probs_full[:, SPOOF_IDX].unsqueeze(1)
+    probs = torch.cat([pb, ps], dim=1)  # [B,2]
     return probs
 
+# -------------------- Base64 / Audio Decode --------------------
+def clean_base64(s: str) -> str:
+    """
+    Handles:
+      - whitespace/newlines
+      - data URI prefixes like: data:audio/mp3;base64,AAAA...
+    """
+    if not isinstance(s, str):
+        raise ValueError("audioBase64 must be a string")
 
-# -------------------- Audio utils --------------------
-def sniff_audio_format(data: bytes) -> Optional[str]:
-    if len(data) >= 12 and data[0:4] == b"RIFF" and data[8:12] == b"WAVE":
-        return "wav"
-    if len(data) >= 3 and data[0:3] == b"ID3":
-        return "mp3"
-    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
-        return "mp3"
-    return None
+    s = s.strip()
 
+    # If it’s a data URI, take payload after the first comma
+    if s.lower().startswith("data:") and "base64," in s.lower():
+        s = s.split(",", 1)[1]
 
-def bytes_to_wav_16k_mono(audio_bytes: bytes, audio_format: Optional[str]) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    fmt = audio_format or sniff_audio_format(audio_bytes)
+    # remove whitespace/newlines
+    s = "".join(s.split())
+    return s
 
-    seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format=fmt)
+def mp3_bytes_to_wav_16k_mono(audio_bytes: bytes) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Hackathon input is ALWAYS mp3.
+    We force format='mp3' to prevent ffmpeg/pydub guessing wrong (e.g., treating MP3 as WAV).
+    """
+    seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+
     orig_channels = seg.channels
     orig_sr = seg.frame_rate
     orig_width = seg.sample_width
 
+    # internal normalization for model
     seg = seg.set_channels(1).set_frame_rate(TARGET_SR)
 
     samples = seg.get_array_of_samples()
-    max_int = float(2 ** (8 * orig_width - 1))
+    max_int = float(2 ** (8 * orig_width - 1)) if orig_width else 32768.0
     wav = torch.tensor(samples, dtype=torch.float32) / max_int
     wav = wav.unsqueeze(0)  # [1, T]
 
     meta = {
-        "input_format": fmt or "unknown",
+        "input_format": "mp3",
         "orig_sample_rate": orig_sr,
         "orig_channels": orig_channels,
         "orig_sample_width_bytes": orig_width,
@@ -110,13 +176,8 @@ def bytes_to_wav_16k_mono(audio_bytes: bytes, audio_format: Optional[str]) -> Tu
     }
     return wav, meta
 
-
+# -------------------- Windowing helpers --------------------
 def pad_or_truncate(wav_1xt: torch.Tensor, target_len: int, pad_mode: str = "repeat") -> Tuple[torch.Tensor, str]:
-    """
-    Strict fixed-length enforcement.
-    - short: repeat-pad (recommended) or zero-pad
-    - long: truncate
-    """
     t = int(wav_1xt.shape[1])
     if t <= 0:
         return torch.zeros((1, target_len), dtype=wav_1xt.dtype), "empty_zero_padded"
@@ -133,27 +194,16 @@ def pad_or_truncate(wav_1xt: torch.Tensor, target_len: int, pad_mode: str = "rep
 
     return wav_1xt, "unchanged"
 
-
-# -------------------- Robust helpers --------------------
-def parse_bool(v) -> bool:
-    if v is None:
-        return False
-    if isinstance(v, bool):
-        return v
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
 def get_windows(wav_1xt: torch.Tensor, win_len: int, hop_len: int) -> torch.Tensor:
     """
-    wav_1xt: [1, T]
-    returns windows: [N, win_len]
+    wav_1xt: [1, T] -> windows: [N, win_len]
     """
     assert wav_1xt.dim() == 2 and wav_1xt.size(0) == 1
     T = wav_1xt.size(1)
 
     if T <= win_len:
         w, _ = pad_or_truncate(wav_1xt, win_len, pad_mode="repeat")
-        return w.squeeze(0).unsqueeze(0)  # [1, win_len]
+        return w.squeeze(0).unsqueeze(0)
 
     n = 1 + (T - win_len) // hop_len
     if (T - win_len) % hop_len != 0:
@@ -167,7 +217,6 @@ def get_windows(wav_1xt: torch.Tensor, win_len: int, hop_len: int) -> torch.Tens
         chunk, _ = pad_or_truncate(chunk, win_len, pad_mode="repeat")
         chunks.append(chunk.squeeze(0))
     return torch.stack(chunks, dim=0)
-
 
 def topk_mean_probs(p_bonafide_list: List[float], p_spoof_list: List[float], k: int) -> Tuple[float, float, Dict[str, Any]]:
     n = len(p_spoof_list)
@@ -193,164 +242,125 @@ def topk_mean_probs(p_bonafide_list: List[float], p_spoof_list: List[float], k: 
     }
     return float(pb), float(ps), stats
 
-
-# -------------------- Explanation --------------------
-def make_explanation_text(
-    classification: str,
-    confidence: float,
-    p_bonafide: float,
-    p_spoof: float,
-    threshold: float,
-    audio_meta: Dict[str, Any],
-    mode: str,
-    pad_action: str,
-    window_stats: Optional[Dict[str, Any]] = None,
-) -> str:
-    dur = audio_meta.get("duration_sec", None)
-    in_fmt = audio_meta.get("input_format", "unknown")
-    orig_sr = audio_meta.get("orig_sample_rate", "unknown")
-    final_sr = audio_meta.get("final_sample_rate", TARGET_SR)
-    analyzed_sec = FIXED_NUM_SAMPLES / TARGET_SR
-
-    parts = []
-    if isinstance(dur, (int, float)):
-        parts.append(f"Processed a {dur:.2f}s {in_fmt.upper()} clip (orig {orig_sr} Hz) and converted it to {final_sr} Hz mono.")
-    else:
-        parts.append(f"Processed a {in_fmt.upper()} clip and converted it to {final_sr} Hz mono.")
-
-    if mode == "fast":
-        parts.append(f"Mode=fast: analyzed ~{analyzed_sec:.2f}s (pad/truncate: {pad_action}).")
-    else:
-        if window_stats:
-            parts.append(
-                f"Mode=robust: analyzed {window_stats.get('num_windows')} windows "
-                f"(window={window_stats.get('window_sec', analyzed_sec):.2f}s, hop={window_stats.get('hop_sec', 2.0):.2f}s) "
-                f"using top-{window_stats.get('topk', DEFAULT_TOPK)} mean aggregation."
-            )
-        else:
-            parts.append("Mode=robust: used sliding windows and top-K mean aggregation.")
-
-    parts.append(f"Scores: spoof={p_spoof:.6f}, bonafide={p_bonafide:.6f}; threshold={threshold:.2f}.")
-    parts.append(f"Final classification: {classification} (confidence={confidence:.4f}).")
-    return " ".join(parts)
-
+# -------------------- Explanation (short, spec-friendly) --------------------
+def short_explanation(classification: str, p_spoof: float, threshold: float) -> str:
+    if classification == "AI_GENERATED":
+        return f"Detected synthetic-voice artifacts; spoof score {p_spoof:.2f} exceeded threshold {threshold:.2f}."
+    return f"No strong synthetic artifacts; spoof score {p_spoof:.2f} below threshold {threshold:.2f}."
 
 # -------------------- Routes --------------------
+
+
+@app.get("/")
+def home():
+    return render_template("index.html")
+
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "device": str(MODEL_DEVICE), "model_id": MODEL_ID})
+    return jsonify({
+        "status": "ok",
+        "device": str(MODEL_DEVICE),
+        "model_id": MODEL_ID,
+    })
 
-
-@app.post("/detect")
-def detect():
+@app.post("/api/voice-detection")
+def voice_detection():
     t0 = time.time()
 
-    language = None
-    audio_format = None
-    audio_bytes = None
+    payload = request.get_json(force=True, silent=True) or {}
 
-    robust = False
+    # Required fields per spec
+    language = payload.get("language", "")
+    audio_format = payload.get("audioFormat", "")
+    audio_b64 = payload.get("audioBase64", "")
+
+    # Basic validation
+    if not isinstance(language, str) or not language.strip():
+        return jsonify({"status": "error", "message": "Invalid API key or malformed request"}), 400
+    lang_norm = language.strip().lower()
+    if lang_norm not in SUPPORTED_LANGS:
+        return jsonify({"status": "error", "message": "Invalid API key or malformed request"}), 400
+
+    if not isinstance(audio_format, str) or audio_format.strip().lower() != "mp3":
+        return jsonify({"status": "error", "message": "Invalid API key or malformed request"}), 400
+
+    if not isinstance(audio_b64, str) or not audio_b64.strip():
+        return jsonify({"status": "error", "message": "Invalid API key or malformed request"}), 400
+
+    # Optional knobs (won't break spec if ignored by evaluator)
+    # If present, they can help your own testing.
     topk = DEFAULT_TOPK
-
-    # 1) multipart/form-data
-    if "file" in request.files:
-        f = request.files["file"]
-        audio_bytes = f.read()
-        if f.filename and "." in f.filename:
-            audio_format = f.filename.rsplit(".", 1)[-1].lower()
-        language = request.form.get("language")
-
-        robust = parse_bool(request.form.get("robust")) or (request.form.get("mode") == "robust")
-        if request.form.get("topk") is not None:
-            try:
-                topk = int(request.form.get("topk"))
-            except Exception:
-                topk = DEFAULT_TOPK
-    else:
-        # 2) JSON base64
-        payload = request.get_json(force=True, silent=True) or {}
-        if "audio_b64" not in payload:
-            return jsonify({"error": "Provide either multipart 'file' or JSON 'audio_b64'."}), 400
-
-        language = payload.get("language")
-        audio_format = payload.get("audio_format")
-
-        robust = parse_bool(payload.get("robust")) or (payload.get("mode") == "robust")
-        if payload.get("topk") is not None:
-            try:
-                topk = int(payload.get("topk"))
-            except Exception:
-                topk = DEFAULT_TOPK
-
+    if payload.get("topk") is not None:
         try:
-            audio_bytes = base64.b64decode(payload["audio_b64"])
-        except Exception as e:
-            return jsonify({"error": f"Invalid base64: {str(e)}"}), 400
+            topk = int(payload.get("topk"))
+        except Exception:
+            topk = DEFAULT_TOPK
 
-    # Decode
+    # Decode base64 -> MP3 bytes
     try:
-        wav, audio_meta = bytes_to_wav_16k_mono(audio_bytes, audio_format)
+        audio_b64_clean = clean_base64(audio_b64)
+        audio_bytes = base64.b64decode(audio_b64_clean)
+    except Exception:
+        return jsonify({"status": "error", "message": "Invalid API key or malformed request"}), 400
+
+    # Decode MP3 -> waveform
+    try:
+        wav, audio_meta = mp3_bytes_to_wav_16k_mono(audio_bytes)
         wav_stats = {
             "min": float(wav.min().item()),
             "max": float(wav.max().item()),
             "mean": float(wav.mean().item()),
             "std": float(wav.std().item()),
         }
-    except Exception as e:
-        return jsonify({"error": f"Audio decode failed (check ffmpeg + format): {str(e)}"}), 400
+    except Exception:
+        # keep message generic for hackathon
+        return jsonify({"status": "error", "message": "Invalid API key or malformed request"}), 400
 
+    # Too-short guard (your old logic, but hackathon wants only HUMAN/AI_GENERATED;
+    # we’ll still return HUMAN with low confidence rather than UNKNOWN)
     if audio_meta["duration_sec"] < 0.5:
-        return jsonify({
-            "classification": "UNKNOWN",
-            "confidence": 0.0,
-            "explanation_text": "Audio too short (<0.5s) to make a reliable decision.",
-            "explanation": {
-                "reason": "Audio too short (<0.5s).",
-                "language": language,
-                "audio_meta": audio_meta,
-                "waveform_stats": wav_stats,
-            },
-            "processing_ms": int((time.time() - t0) * 1000),
-        }), 200
+        resp = {
+            "status": "success",
+            "language": language,
+            "classification": "HUMAN",
+            "confidenceScore": 0.50,
+            "explanation": "Audio too short for reliable decision; defaulting to HUMAN with low confidence.",
+        }
+        return jsonify(resp), 200
 
     analyzed_sec = FIXED_NUM_SAMPLES / TARGET_SR
-    do_sliding = bool(robust and audio_meta["duration_sec"] > analyzed_sec + 0.1)
-
-    p_bonafide = 0.0
-    p_spoof = 0.0
-    pad_action = "unchanged"
-    mode = "robust" if do_sliding else "fast"
-    window_stats: Optional[Dict[str, Any]] = None
+    do_sliding = bool(AUTO_ROBUST and audio_meta["duration_sec"] > analyzed_sec + 0.1)
 
     try:
         if not do_sliding:
-            wav_fixed, pad_action = pad_or_truncate(wav, FIXED_NUM_SAMPLES, pad_mode="repeat")  # [1,64600]
+            wav_fixed, pad_action = pad_or_truncate(wav, FIXED_NUM_SAMPLES, pad_mode="repeat")
             probs = infer_probs_from_wav_batch(wav_fixed)  # [1,2]
             p_bonafide = float(probs[0, 0].item())
             p_spoof = float(probs[0, 1].item())
+            mode = "fast"
+            window_stats = None
         else:
             hop_len = int(HOP_SECONDS * TARGET_SR)
             win_len = FIXED_NUM_SAMPLES
-
-            windows = get_windows(wav, win_len=win_len, hop_len=hop_len)  # [N,64600]
+            windows = get_windows(wav, win_len=win_len, hop_len=hop_len)  # [N, win_len]
             probs = infer_probs_from_wav_batch(windows)  # [N,2]
 
             pb_list = probs[:, 0].detach().cpu().tolist()
             ps_list = probs[:, 1].detach().cpu().tolist()
 
             p_bonafide, p_spoof, stats = topk_mean_probs(pb_list, ps_list, k=topk)
-            pad_action = "sliding_windows"
-
+            mode = "robust"
             window_stats = {
                 **stats,
                 "window_sec": float(win_len / TARGET_SR),
                 "hop_sec": float(hop_len / TARGET_SR),
                 "aggregation": f"topk_mean(k={max(1, min(int(topk), len(ps_list)))})",
             }
-    except Exception as e:
-        return jsonify({"error": f"Model inference failed: {str(e)}"}), 500
+            pad_action = "sliding_windows"
+    except Exception:
+        return jsonify({"status": "error", "message": "Invalid API key or malformed request"}), 500
 
-    # Decision (spoof => AI_GENERATED)
+    # Decision
     if p_spoof >= DEFAULT_THRESHOLD:
         classification = "AI_GENERATED"
         confidence = p_spoof
@@ -358,47 +368,32 @@ def detect():
         classification = "HUMAN"
         confidence = p_bonafide
 
-    explanation_text = make_explanation_text(
-        classification=classification,
-        confidence=confidence,
-        p_bonafide=p_bonafide,
-        p_spoof=p_spoof,
-        threshold=DEFAULT_THRESHOLD,
-        audio_meta=audio_meta,
-        mode=mode,
-        pad_action=pad_action,
-        window_stats=window_stats,
-    )
-
-    return jsonify({
+    resp = {
+        "status": "success",
+        "language": language,
         "classification": classification,
-        "confidence": round(float(confidence), 4),
-        "explanation_text": explanation_text,
-        "explanation": {
+        "confidenceScore": round(float(confidence), 4),
+        "explanation": short_explanation(classification, p_spoof, DEFAULT_THRESHOLD),
+    }
+
+    # Optional debug (keep OFF for submission unless allowed)
+    if INCLUDE_DEBUG:
+        resp["_debug"] = {
             "model_id": MODEL_ID,
-            "model_type": "Wav2Vec2 audio classification (bonafide vs spoof)",
-            "label_mapping": {"0": "bonafide(HUMAN)", "1": "spoof(AI)"},
-            "language": language,
+            "scores": {"p_bonafide": round(float(p_bonafide), 6), "p_spoof": round(float(p_spoof), 6)},
+            "mode": mode,
             "audio_meta": audio_meta,
             "waveform_stats": wav_stats,
-            "mode": mode,
-            "preprocess": {
-                "target_sample_rate": TARGET_SR,
-                "fixed_num_samples": FIXED_NUM_SAMPLES,
-                "pad_or_truncate": pad_action,
-                "threshold_spoof": DEFAULT_THRESHOLD,
-            },
             "windowing": window_stats,
-            "scores": {
-                "p_bonafide": round(float(p_bonafide), 6),
-                "p_spoof": round(float(p_spoof), 6),
-            },
-        },
-        "processing_ms": int((time.time() - t0) * 1000),
-    }), 200
+            "processing_ms": int((time.time() - t0) * 1000),
+            "threshold": DEFAULT_THRESHOLD,
+            "label_indices": {"bonafide": BONA_IDX, "spoof": SPOOF_IDX},
+        }
+
+    return jsonify(resp), 200
 
 
 if __name__ == "__main__":
-    # app.run(host="0.0.0.0", port=5000, debug=True)
     port = int(os.getenv("PORT", "5000"))
+    # use_reloader=False to avoid double-loading HF models
     app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
