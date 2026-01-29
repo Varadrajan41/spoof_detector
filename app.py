@@ -389,6 +389,6 @@ def voice_detection():
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.getenv("PORT", "8080"))
     # use_reloader=False to avoid double-loading HF models
     app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
