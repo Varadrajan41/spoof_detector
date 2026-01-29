@@ -33,12 +33,7 @@ AUTO_ROBUST = os.getenv("AUTO_ROBUST", "1").strip().lower() in {"1", "true", "ye
 
 # Model
 MODEL_ID = os.getenv("MODEL_ID", "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification")
-# New model (spoof vs bonafide)
-# MODEL_ID = os.getenv("MODEL_ID", "WWWxp/wav2vec2_spoof_dection1") # can be improved - working
-# MODEL_ID = os.getenv("MODEL_ID", "HyperMoon/wav2vec2-base-960h-finetuned-deepfake") # straight no
-# MODEL_ID = os.getenv("MODEL_ID", "garystafford/wav2vec2-deepfake-voice-detector") # try as this is the fine tuned model of above best model
-# MODEL_ID = os.getenv("MODEL_ID", "DavidCombei/wavLM-base-Deepfake_V2") # try in benchmarking not reliable though- can't say- benchmark
-# MODEL_ID = os.getenv("MODEL_ID", "microsoft/wavlm-base-plus-sv") # try another time - getting some error  from layers
+
 
 # Optional: include debug fields in response (keep OFF for hackathon)
 INCLUDE_DEBUG = os.getenv("INCLUDE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
